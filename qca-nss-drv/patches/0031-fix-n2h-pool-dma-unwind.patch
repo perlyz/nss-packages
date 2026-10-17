@@ -1,0 +1,78 @@
+From: OpenWrt Build System <openwrt@localhost>
+Subject: [PATCH] nss-drv: unwind DMA mappings on N2H buffer pool setup failures
+
+When memory allocation or DMA mapping fails during N2H buffer pool
+initialization, unmap previously mapped pages before freeing to avoid
+DMA resource leakage and kernel warnings.
+
+Signed-off-by: OpenWrt Build System <openwrt@localhost>
+---
+--- a/nss_n2h.c
++++ b/nss_n2h.c
+@@ -1164,10 +1164,16 @@ failure:
+ 	return NSS_TX_FAILURE;
+ }
+ 
+-static inline void nss_n2h_buf_pool_free(struct nss_n2h_buf_pool *buf_pool)
++static inline void nss_n2h_buf_pool_free(struct nss_ctx_instance *nss_ctx,
++					 struct nss_n2h_buf_pool *buf_pool,
++					 int num_pages)
+ {
+ 	int page_count;
+-	for (page_count = 0; page_count < buf_pool->nss_buf_num_pages; page_count++) {
++	for (page_count = 0; page_count < num_pages; page_count++) {
++		dma_unmap_single(nss_ctx->dev, buf_pool->nss_buf_pool_addr[page_count],
++				 PAGE_SIZE, DMA_TO_DEVICE);
+ 		kfree((void *)buf_pool->nss_buf_pool_vaddr[page_count]);
++		buf_pool->nss_buf_pool_addr[page_count] = 0;
++		buf_pool->nss_buf_pool_vaddr[page_count] = 0;
+ 	}
+ }
+ 
+@@ -1202,21 +1208,32 @@ static nss_tx_status_t nss_n2h_buf_pool_
+ 		buf_pool->nss_buf_page_size = PAGE_SIZE;
+ 
+ 		for (page_count = 0; page_count < MAX_PAGES_PER_MSG && num_pages; page_count++, num_pages--) {
++			dma_addr_t dma_addr;
+ 			void *kern_addr = kzalloc(PAGE_SIZE, GFP_ATOMIC);
+ 			if (!kern_addr) {
+-				BUG_ON(!page_count);
+-				break;
++				nss_warning("%px: memory allocation failed for pbuf pool\n", nss_ctx);
++				nss_n2h_buf_pool_free(nss_ctx, buf_pool, page_count);
++				goto failure;
+ 			}
+ 
+ 			kmemleak_not_leak(kern_addr);
+ 			buf_pool->nss_buf_pool_vaddr[page_count] = (nss_ptr_t)kern_addr;
+-			buf_pool->nss_buf_pool_addr[page_count] = dma_map_single(nss_ctx->dev, kern_addr, PAGE_SIZE, DMA_TO_DEVICE);
++			dma_addr = dma_map_single(nss_ctx->dev, kern_addr, PAGE_SIZE, DMA_TO_DEVICE);
++			if (dma_mapping_error(nss_ctx->dev, dma_addr)) {
++				kfree(kern_addr);
++				buf_pool->nss_buf_pool_vaddr[page_count] = 0;
++				nss_warning("%px: DMA mapping failed for pbuf pool\n", nss_ctx);
++				nss_n2h_buf_pool_free(nss_ctx, buf_pool, page_count);
++				goto failure;
++			}
++
++			buf_pool->nss_buf_pool_addr[page_count] = dma_addr;
+ 		}
+ 
+ 		buf_pool->nss_buf_num_pages = page_count;
+ 		nss_tx_status = nss_n2h_tx_msg(nss_ctx, &nnm);
+ 		if (nss_tx_status != NSS_TX_SUCCESS) {
+ 
+-			nss_n2h_buf_pool_free(buf_pool);
++			nss_n2h_buf_pool_free(nss_ctx, buf_pool, buf_pool->nss_buf_num_pages);
+ 			nss_warning("%px: nss_tx error setting pbuf\n", nss_ctx);
+ 			goto failure;
+ 		}
+@@ -1235,7 +1252,7 @@ static nss_tx_status_t nss_n2h_buf_pool_
+ 		 */
+ 		if (NSS_FAILURE == nss_n2h_bufcp[core_num].response) {
+ 
+-			nss_n2h_buf_pool_free(buf_pool);
++			nss_n2h_buf_pool_free(nss_ctx, buf_pool, buf_pool->nss_buf_num_pages);
+ 			goto failure;
+ 		}
+ 
