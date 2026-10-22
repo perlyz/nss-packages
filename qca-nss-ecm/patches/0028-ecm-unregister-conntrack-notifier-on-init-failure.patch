@@ -1,0 +1,56 @@
+Subject: ecm: unregister the conntrack notifier on netns setup failure
+
+The notifier is registered before nf_ct_netns_get(). Both failure paths must
+remove it before module init returns and frees ECM state/code. Use the same
+API selection for failure and normal teardown, including chain-event kernels.
+
+--- a/ecm_conntrack_notifier.c
++++ b/ecm_conntrack_notifier.c
+@@ -405,6 +405,16 @@
+ #endif
+ };
+ #endif
++
++/* Unregister also waits for in-flight chain callbacks before state is freed. */
++static void ecm_conntrack_notifier_unregister(void)
++{
++#if defined(CONFIG_NF_CONNTRACK_CHAIN_EVENTS) || (LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0))
++	nf_conntrack_unregister_notifier(&init_net, &ecm_conntrack_notifier);
++#else
++	nf_conntrack_unregister_notifier(&init_net);
++#endif
++}
+ #endif
+ 
+ /*
+@@ -466,6 +476,7 @@
+ 	result = nf_ct_netns_get(&init_net, NFPROTO_IPV4);
+ 	if (result < 0) {
+ 		DEBUG_ERROR("Can't hold ipv4 netns.\n");
++		ecm_conntrack_notifier_unregister();
+ 		debugfs_remove_recursive(ecm_conntrack_notifier_dentry);
+ 		return result;
+ 	}
+@@ -473,6 +484,7 @@
+ 	result = nf_ct_netns_get(&init_net, NFPROTO_IPV6);
+ 	if (result < 0) {
+ 		DEBUG_ERROR("Can't hold ipv6 netns.\n");
++		ecm_conntrack_notifier_unregister();
+ 		nf_ct_netns_put(&init_net, NFPROTO_IPV4);
+ 		debugfs_remove_recursive(ecm_conntrack_notifier_dentry);
+ 		return result;
+@@ -499,13 +511,7 @@
+ #ifdef ECM_IPV6_ENABLE
+ 	nf_ct_netns_put(&init_net, NFPROTO_IPV6);
+ #endif
+-#ifdef CONFIG_NF_CONNTRACK_CHAIN_EVENTS
+-	nf_conntrack_unregister_notifier(&init_net, &ecm_conntrack_notifier);
+-#elif (LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0))
+-	nf_conntrack_unregister_notifier(&init_net, &ecm_conntrack_notifier);
+-#else
+-   nf_conntrack_unregister_notifier(&init_net);
+-#endif
++	ecm_conntrack_notifier_unregister();
+ #endif
+ 	/*
+ 	 * Remove the debugfs files recursively.
