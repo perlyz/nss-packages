@@ -1,0 +1,257 @@
+Subject: nss-drv: reject failed frequency writes without changing control state
+
+Keep current_freq reads side-effect free, but parse writes into private values
+and validate readiness, requested modes/frequencies and work allocation before
+updating NSS control state. Report errors instead of claiming unapplied writes
+succeeded. Use private work pointers in these control paths.
+
+Keep the 11.4 fixed-frequency statistics stream enabled. Record the scale
+index for fixed-frequency PM requests, otherwise a later auto_scale=0 write
+reverts the clock to an older index even though autoscaling was already off.
+
+--- a/nss_init.c
++++ b/nss_init.c
+@@ -176,59 +176,42 @@
+  */
+ static int nss_current_freq_handler(compat_const struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
++	struct ctl_table tmp = *ctl;
++	nss_work_t *work;
++	int frequency = nss_cmd_buf.current_freq;
+ 	int ret, i;
+ 
+-	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+-
++	/* Parse writes privately: failed requests must not change reported state. */
++	tmp.data = &frequency;
++	ret = proc_dointvec(write ? &tmp : ctl, write, buffer, lenp, ppos);
+ 	if (ret || !write || !*lenp)
+ 		return ret;
+ 
+-	if (!nss_wq)
+-		return ret;
+-
+-	printk("Frequency Set to %d\n", nss_cmd_buf.current_freq);
+-
+-	/*
+-	 * Check if frequency exists in frequency Table
+-	 */
+-	i = 0;
+-	while (i < NSS_FREQ_MAX_SCALE) {
+-		if (nss_runtime_samples.freq_scale[i].frequency == nss_cmd_buf.current_freq) {
++	if (!nss_wq || nss_top_main.nss[NSS_CORE_0].state != NSS_CORE_STATE_INITIALIZED)
++		return -EAGAIN;
++
++	for (i = 0; i < NSS_FREQ_MAX_SCALE; i++) {
++		if (frequency > 0 && nss_runtime_samples.freq_scale[i].frequency == (uint32_t)frequency)
+ 			break;
+-		}
+-		i++;
+-	}
+-	if (i == NSS_FREQ_MAX_SCALE) {
+-		printk("Frequency not found. Please check Frequency Table\n");
+-		nss_cmd_buf.current_freq = nss_runtime_samples.freq_scale[nss_runtime_samples.freq_scale_index].frequency;
+-		return ret;
+-	}
+-
+-	/*
+-	 * Turn off frequency scaling, but keep NSS core stats enabled so
+-	 * cpu_load_ubi keeps updating while running at a fixed frequency.
+-	*/
++	}
++	if (i == NSS_FREQ_MAX_SCALE)
++		return -EINVAL;
++
++	work = kmalloc(sizeof(*work), GFP_ATOMIC);
++	if (!work)
++		return -ENOMEM;
++
++	INIT_WORK((struct work_struct *)work, nss_hal_wq_function);
++	work->frequency = frequency;
++	work->stats_enable = 1;
++
++	nss_cmd_buf.current_freq = frequency;
+ 	nss_cmd_buf.auto_scale = 0;
+ 	nss_runtime_samples.freq_scale_ready = 0;
+ 	nss_runtime_samples.freq_scale_index = i;
+-
+-	nss_work = (nss_work_t *)kmalloc(sizeof(nss_work_t), GFP_ATOMIC);
+-	if (!nss_work) {
+-		nss_info("NSS Freq WQ kmalloc fail");
+-		return ret;
+-	}
+-	INIT_WORK((struct work_struct *)nss_work, nss_hal_wq_function);
+-	nss_work->frequency = nss_cmd_buf.current_freq;
+-	nss_work->stats_enable = 1;
+-
+-	/*
+-	 * Start the fixed-frequency stats window with a fresh sample set.
+-	 */
+ 	nss_reset_frequency_stats_samples();
+-
+-	queue_work(nss_wq, (struct work_struct *)nss_work);
+-
+-	return ret;
++	queue_work(nss_wq, (struct work_struct *)work);
++	return 0;
+ }
+ 
+ /*
+@@ -237,73 +220,43 @@
+  */
+ static int nss_auto_scale_handler(compat_const struct ctl_table *ctl, int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
++	struct ctl_table tmp = *ctl;
++	nss_work_t *work;
++	int auto_scale = nss_cmd_buf.auto_scale;
+ 	int ret;
+-
+-	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+-
+-	if (!*lenp || (*ppos && !write)) {
++	unsigned int index;
++
++	tmp.data = &auto_scale;
++	ret = proc_dointvec(write ? &tmp : ctl, write, buffer, lenp, ppos);
++	if (ret || !write || !*lenp)
+ 		return ret;
+-	}
+-
+-	if (!write) {
+-		return ret;
+-	}
+-
+-	if (!nss_wq) {
+-		return ret;
+-	}
+-
+-	if (nss_cmd_buf.auto_scale != 1) {
+-		/*
+-		 * Disable frequency scaling, but keep core stats reporting
+-		 * enabled. HLOS gates scaling decisions with auto_scale; the
+-		 * firmware stats stream is also used by cpu_load_ubi.
+-		 */
+-		nss_cmd_buf.auto_scale = 0;
+-		nss_cmd_buf.current_freq = nss_runtime_samples.freq_scale[nss_runtime_samples.freq_scale_index].frequency;
+-
+-		nss_work = (nss_work_t *)kmalloc(sizeof(nss_work_t), GFP_ATOMIC);
+-		if (!nss_work) {
+-			nss_info("NSS Freq WQ kmalloc fail");
+-			return ret;
+-		}
+-
+-		INIT_WORK((struct work_struct *)nss_work, nss_hal_wq_function);
+-		nss_work->frequency = nss_cmd_buf.current_freq;
+-		nss_work->stats_enable = 1;
+-		queue_work(nss_wq, (struct work_struct *)nss_work);
+-		nss_runtime_samples.freq_scale_ready = 0;
+-
+-		/*
+-		 * Keep collecting fixed-frequency samples from a clean window.
+-		 */
+-		nss_reset_frequency_stats_samples();
+-
+-		return ret;
+-	}
+-
+-	/*
+-	 * Setup default values - Middle of Freq Scale Band
+-	 */
+-	nss_runtime_samples.freq_scale_index = 1;
+-	nss_runtime_samples.sample_count = 0;
+-	nss_runtime_samples.initialized = 0;
++	if (auto_scale != 0 && auto_scale != 1)
++		return -EINVAL;
++	if (!nss_wq || nss_top_main.nss[NSS_CORE_0].state != NSS_CORE_STATE_INITIALIZED)
++		return -EAGAIN;
++
++	index = auto_scale ? NSS_FREQ_MID_SCALE : nss_runtime_samples.freq_scale_index;
++	if (index >= NSS_FREQ_MAX_SCALE || !nss_runtime_samples.freq_scale[index].frequency)
++		return -EINVAL;
++
++	work = kmalloc(sizeof(*work), GFP_ATOMIC);
++	if (!work)
++		return -ENOMEM;
++
++	INIT_WORK((struct work_struct *)work, nss_hal_wq_function);
++	work->frequency = nss_runtime_samples.freq_scale[index].frequency;
++	/* Fixed-frequency operation still needs firmware statistics for cpu_load_ubi. */
++	work->stats_enable = 1;
++
++	nss_cmd_buf.auto_scale = auto_scale;
++	nss_cmd_buf.current_freq = work->frequency;
++	nss_runtime_samples.freq_scale_index = index;
+ 	nss_runtime_samples.freq_scale_ready = 0;
+-	nss_cmd_buf.current_freq = nss_runtime_samples.freq_scale[nss_runtime_samples.freq_scale_index].frequency;
+-
+-	nss_work = (nss_work_t *)kmalloc(sizeof(nss_work_t), GFP_ATOMIC);
+-	if (!nss_work) {
+-		nss_info("NSS Freq WQ kmalloc fail");
+-		return ret;
+-	}
+-	INIT_WORK((struct work_struct *)nss_work, nss_hal_wq_function);
+-	nss_work->frequency = nss_cmd_buf.current_freq;
+-	nss_work->stats_enable = 1;
+-	queue_work(nss_wq, (struct work_struct *)nss_work);
+-
+-	nss_cmd_buf.auto_scale = 1;
+-
+-	return ret;
++	if (auto_scale)
++		nss_runtime_samples.initialized = 0;
++	nss_reset_frequency_stats_samples();
++	queue_work(nss_wq, (struct work_struct *)work);
++	return 0;
+ }
+ 
+ /*
+--- a/nss_freq.c
++++ b/nss_freq.c
+@@ -396,31 +396,28 @@
+  */
+ bool nss_freq_sched_change(nss_freq_scales_t index, bool auto_scale)
+ {
+-	if (index >= NSS_FREQ_MAX_SCALE) {
+-		nss_info("NSS freq scale beyond limit\n");
++	nss_work_t *work;
++
++	if ((unsigned int)index >= NSS_FREQ_MAX_SCALE || !nss_wq ||
++	    !nss_runtime_samples.freq_scale[index].frequency)
+ 		return false;
+-	}
+-
+-	nss_work = (nss_work_t *)kmalloc(sizeof(nss_work_t), GFP_ATOMIC);
+-	if (!nss_work) {
+-		nss_info("NSS Freq WQ kmalloc fail");
++
++	work = kmalloc(sizeof(*work), GFP_ATOMIC);
++	if (!work)
+ 		return false;
+-	}
+-
+-	INIT_WORK((struct work_struct *)nss_work, nss_hal_wq_function);
+-
+-	nss_work->frequency = nss_runtime_samples.freq_scale[index].frequency;
++
++	INIT_WORK((struct work_struct *)work, nss_hal_wq_function);
++	work->frequency = nss_runtime_samples.freq_scale[index].frequency;
++	work->stats_enable = 1;
+ 
+ 	if (!auto_scale) {
+ 		nss_cmd_buf.auto_scale = 0;
+ 		nss_runtime_samples.freq_scale_ready = 0;
+-	}
+-
+-	/* Keep NSS core stats enabled even when fixed-frequency scaling is requested. */
+-	nss_work->stats_enable = 1;
+-	nss_cmd_buf.current_freq = nss_work->frequency;
+-	queue_work(nss_wq, (struct work_struct *)nss_work);
+-
++		/* PM requests must update the index used by later auto_scale=0 writes. */
++		nss_runtime_samples.freq_scale_index = index;
++	}
++	nss_cmd_buf.current_freq = work->frequency;
++	queue_work(nss_wq, (struct work_struct *)work);
+ 	return true;
+ }
+ 
