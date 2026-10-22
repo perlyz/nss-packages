@@ -1,0 +1,105 @@
+Subject: ecm: retain inner VLAN headers above bridge access ports
+
+On NSS kernels vlan_dev_real_dev() walks through every VLAN upper. Use the
+immediate lower device to apply bridge-port stripping only to the VLAN that
+is directly above the bridge. Inner QinQ tags remain on the wire even when
+they use the same VID as the stripped outer VLAN.
+
+Pack retained tags into the first available rule slot. Interface hierarchy
+counts include stripped VLAN devices and must not leave a secondary tag
+without a primary tag. Apply this to all four NSS IPv4/IPv6 frontends.
+
+--- a/ecm_interface.c
++++ b/ecm_interface.c
+@@ -364,7 +364,10 @@
+ 		return -1;
+ 	}
+ 
+-	real_dev = vlan_dev_real_dev(vlan_dev);
++	/* Only the VLAN directly above the bridge is stripped on an access port.
++	 * vlan_dev_real_dev() skips intermediate VLAN devices on NSS kernels.
++	 */
++	real_dev = vlan_dev_next_dev(vlan_dev);
+ 	vid = vlan_dev_vlan_id(vlan_dev);
+ 
+ 	if (!netif_is_bridge_master(real_dev) || !br_vlan_enabled(real_dev)) {
+--- a/frontends/nss/ecm_nss_ported_ipv4.c
++++ b/frontends/nss/ecm_nss_ported_ipv4.c
+@@ -628,7 +628,7 @@
+ 				/*
+ 				 * Primary or secondary (QinQ) VLAN?
+ 				 */
+-				if (interface_type_counts[ii_type] == 0) {
++				if (nircm->vlan_primary_rule.ingress_vlan_tag == ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED) {
+ 					nircm->vlan_primary_rule.ingress_vlan_tag = vlan_value;
+ 				} else {
+ 					nircm->vlan_secondary_rule.ingress_vlan_tag = vlan_value;
+@@ -937,7 +937,7 @@
+ 				/*
+ 				 * Primary or secondary (QinQ) VLAN?
+ 				 */
+-				if (interface_type_counts[ii_type] == 0) {
++				if (nircm->vlan_primary_rule.egress_vlan_tag == ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED) {
+ 					nircm->vlan_primary_rule.egress_vlan_tag = vlan_value;
+ 				} else {
+ 					nircm->vlan_secondary_rule.egress_vlan_tag = vlan_value;
+--- a/frontends/nss/ecm_nss_ported_ipv6.c
++++ b/frontends/nss/ecm_nss_ported_ipv6.c
+@@ -622,7 +622,7 @@
+ 				/*
+ 				 * Primary or secondary (QinQ) VLAN?
+ 				 */
+-				if (interface_type_counts[ii_type] == 0) {
++				if (nircm->vlan_primary_rule.ingress_vlan_tag == ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED) {
+ 					nircm->vlan_primary_rule.ingress_vlan_tag = vlan_value;
+ 				} else {
+ 					nircm->vlan_secondary_rule.ingress_vlan_tag = vlan_value;
+@@ -900,7 +900,7 @@
+ 				/*
+ 				 * Primary or secondary (QinQ) VLAN?
+ 				 */
+-				if (interface_type_counts[ii_type] == 0) {
++				if (nircm->vlan_primary_rule.egress_vlan_tag == ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED) {
+ 					nircm->vlan_primary_rule.egress_vlan_tag = vlan_value;
+ 				} else {
+ 					nircm->vlan_secondary_rule.egress_vlan_tag = vlan_value;
+--- a/frontends/nss/ecm_nss_non_ported_ipv4.c
++++ b/frontends/nss/ecm_nss_non_ported_ipv4.c
+@@ -792,7 +792,7 @@
+ 				/*
+ 				 * Primary or secondary (QinQ) VLAN?
+ 				 */
+-				if (interface_type_counts[ii_type] == 0) {
++				if (nircm->vlan_primary_rule.ingress_vlan_tag == ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED) {
+ 					nircm->vlan_primary_rule.ingress_vlan_tag = vlan_value;
+ 				} else {
+ 					nircm->vlan_secondary_rule.ingress_vlan_tag = vlan_value;
+@@ -1057,7 +1057,7 @@
+ 				/*
+ 				 * Primary or secondary (QinQ) VLAN?
+ 				 */
+-				if (interface_type_counts[ii_type] == 0) {
++				if (nircm->vlan_primary_rule.egress_vlan_tag == ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED) {
+ 					nircm->vlan_primary_rule.egress_vlan_tag = vlan_value;
+ 				} else {
+ 					nircm->vlan_secondary_rule.egress_vlan_tag = vlan_value;
+--- a/frontends/nss/ecm_nss_non_ported_ipv6.c
++++ b/frontends/nss/ecm_nss_non_ported_ipv6.c
+@@ -699,7 +699,7 @@
+ 				/*
+ 				 * Primary or secondary (QinQ) VLAN?
+ 				 */
+-				if (interface_type_counts[ii_type] == 0) {
++				if (nircm->vlan_primary_rule.ingress_vlan_tag == ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED) {
+ 					nircm->vlan_primary_rule.ingress_vlan_tag = vlan_value;
+ 				} else {
+ 					nircm->vlan_secondary_rule.ingress_vlan_tag = vlan_value;
+@@ -946,7 +946,7 @@
+ 				/*
+ 				 * Primary or secondary (QinQ) VLAN?
+ 				 */
+-				if (interface_type_counts[ii_type] == 0) {
++				if (nircm->vlan_primary_rule.egress_vlan_tag == ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED) {
+ 					nircm->vlan_primary_rule.egress_vlan_tag = vlan_value;
+ 				} else {
+ 					nircm->vlan_secondary_rule.egress_vlan_tag = vlan_value;
